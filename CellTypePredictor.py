@@ -2,36 +2,53 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import random
 import pandas
 
 class CellTypeClassifier(nn.Module):
+    """
+    Cell Type Classifier, builds a model based on a layer spec defaulting to
+    a fully connected dense layer for each input-output node, interleaved with
+    a rectifier (ReLU) and a final output activation layer (Sigmoid).
+    """
     
-    def __init__(self, h1=(2000,12), h2=(12,8), h3=(8,1)):
+    def __init__(self, layers=((2000,12),(12,8),(8,1)), 
+                 main_layer = nn.Linear,      ## basis for node spec
+                 rectifier_layer = nn.ReLU,   ## interleaved between layers
+                 output_layer=nn.Sigmoid):    ## final output activation
         super().__init__()
-        self.hidden1 = nn.Linear(*h1)
-        self.act1 = nn.ReLU()
-        self.hidden2 = nn.Linear(*h2)
-        self.act2 = nn.ReLU()
-        self.output = nn.Linear(*h3)
-        self.act_output = nn.Sigmoid()
+
+        ## Build the model initially as list
+        forw_layers = []
+        for i, layer in enumerate(layers):
+            forw_layers.append(main_layer(*layer))
+            if i == len(layers) - 1:
+                forw_layers.append(output_layer())
+            else:
+                forw_layers.append(rectifier_layer())
+        
+        ## Now condense it down into a single lambda
+        self.forward_func = nn.Sequential(*forw_layers)
 
     def forward(self, x):
-        return self.act_output(
-            self.output(
-                self.act2(
-                    self.hidden2(
-                        self.act1(self.hidden1(x))))))
+        return self.forward_func(x)
 
 
 class CellTypePrediction:
 
     def __init__(self, raw_dataset, ycol, layer_nodes, 
                  n_epochs=100, batch_size=1000,
-                 multiclass=False, lossplot=True):
+                 multiclass=False, lossplot=True, seed=99):
+
+        ## Reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        CellTypePrediction.set_seed(seed)
         
         index_of_ycol = raw_dataset.columns.tolist().index(ycol)
         self.raw_dataset = raw_dataset
-        self.model = CellTypeClassifier(*layer_nodes)
+        self.model = CellTypeClassifier(layers=layer_nodes)
+        self.ycol = ycol ## for making pseudocells
 
         if multiclass:
             ## Use a softmax as output layer?
@@ -51,6 +68,16 @@ class CellTypePrediction:
         if lossplot:
             self.plotLoss()
 
+    @staticmethod
+    def set_seed(seed):
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    
     ## Public
     def determineAccuracy(self, message=True):
         """Determine how well the training data is predicted"""
@@ -92,16 +119,16 @@ class CellTypePrediction:
         self.test_X = torch.tensor(
             test_dataframe.to_numpy(), 
             dtype=torch.float32)
-        
-        predictions = [self.ctypes_int[int(x[0])]
+
+        predictions = [(self.ctypes_int[int(x[0])] if x[0] < len(self.ctypes_int) else self.ctypes_int[int(x[0])-1])
                        for x in (self.model(self.test_X) * len(self.ctypes_int))
                        .floor().tolist()]
         
         df = pandas.DataFrame()
         got_right = 0
         for i in range(len(test_dataframe)):
-            psd = test_dataframe.iloc[i].name
-            prd = predictions[i]
+            psd = str(test_dataframe.iloc[i].name)
+            prd = str(predictions[i])
             df = pandas.concat([
                 df, 
                 pandas.DataFrame({
@@ -142,22 +169,31 @@ class CellTypePrediction:
         print("TODO")
         return(None)
 
-    def makePseudoCells(self, message=True):
+    def makePseudoCells(self, nperclass=1, from_n = False, message=True):
+        """Make pseudocells from the average of each output class.
+
+        @param nperclass: non-zero integer, how many samples per class to produce.
+        @param from_n: False or non-zero integer, specify from how many samples a pseudocell is made from.        
+        """
         df = pandas.DataFrame()
         for ctype in self.ctypes_nam.keys():
-            df = pandas.concat(
-                [df, self.__makePseudoCell(ctype)], 
-                axis=1)
+            for i in range(nperclass):
+                df = pandas.concat(
+                    [df, self.__makePseudoCell(ctype, from_n)], 
+                    axis=1)
         if message:
-            print("Created", len(self.ctypes_nam), " pseudo cells from the averages of cells in the same output group")
-        else:
-            return(df.T)
+            print("Created", len(df.iloc[0]), "pseudo cells from the averages of cells in the same output group")
+        return(df.T)
         
-    def __makePseudoCell(self, name):
-        ## Filter by a type and apply the mean, then remove the celltype
-        ps = self.raw_dataset[
-            self.raw_dataset["Celltype"] == self.ctypes_nam[name]
-        ].apply(np.mean).round().drop("Celltype")
+    def __makePseudoCell(self, name, subsample=False):
+        """Filter by a type and apply the mean, then remove the celltype. If subsample is positive, don't use all cells in class."""
+        cells_in_nameclass =  self.raw_dataset[self.raw_dataset["Celltype"] == self.ctypes_nam[name]]
+        if subsample:
+            ## Subsample
+            cells_in_nameclass = cells_in_nameclass.sample(n=subsample, replace=True) ## bootstrapping
+
+        ## Merge all, round, drop output var
+        ps = cells_in_nameclass.apply(np.mean).round().drop(self.ycol)        
         ps.name = name
         return(ps)
 
