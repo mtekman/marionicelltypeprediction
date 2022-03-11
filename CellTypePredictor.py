@@ -82,6 +82,7 @@ class CellTypePrediction:
     def determineAccuracy(self, message=True):
         """Determine how well the training data is predicted"""
         mean_accuracy = (self.model(self.X).round() == self.Y).float().mean()
+        self.accuracy = mean_accuracy
         if message:
             print(f"Mean Accuracy: {mean_accuracy}")
         else:
